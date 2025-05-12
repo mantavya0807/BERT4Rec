@@ -9,6 +9,23 @@ from torch.utils.data import Dataset, DataLoader
 import time
 import pickle
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+
+# Check for CUDA availability
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA Available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    device = torch.device('cuda:0')
+    print(f"Device Count: {torch.cuda.device_count()}")
+    print(f"Device Name (GPU 0): {torch.cuda.get_device_name(0)}")
+else:
+    device = torch.device('cpu')
+    print("Using CPU")
+
+# Define paths
+data_dir = './bert4rec_data/'  # Directory containing preprocessed data from 2.py
+model_output_dir = './bert4rec_model/'  # Directory for model outputs
+os.makedirs(model_output_dir, exist_ok=True)
 
 
 class BasketBERT4RecConfig:
@@ -17,12 +34,12 @@ class BasketBERT4RecConfig:
     def __init__(
         self,
         vocab_size=50000,
-        hidden_size=256,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        intermediate_size=1024,
-        hidden_dropout_prob=0.1,
-        attention_probs_dropout_prob=0.1,
+        hidden_size=64,              
+        num_hidden_layers=1,         
+        num_attention_heads=2,       
+        intermediate_size=256,       
+        hidden_dropout_prob=0.3,     
+        attention_probs_dropout_prob=0.3,  # Increased from 0.1
         max_position_embeddings=50,
         max_basket_size=20,
         basket_embedding_type='mean',  # Options: 'mean', 'max', 'attention'
@@ -421,8 +438,7 @@ class BasketBERT4Rec(nn.Module):
                 containing indices of positions to predict.
         
         Returns:
-            prediction_scores: Tensor of shape [batch_size, num_masked, vocab_size]
-                containing prediction scores for masked positions.
+            prediction_scores or sequence_output: Depending on whether masked_positions is provided
         """
         device = input_baskets.device
         batch_size, seq_length = input_baskets.size()[:2]
@@ -454,8 +470,7 @@ class BasketBERT4Rec(nn.Module):
         # Get predictions for masked positions or all positions
         if masked_positions is not None:
             # Gather embeddings at masked positions
-            # Reshape masked_positions for gathering: [batch_size*num_masked, 1]
-            batch_size, num_masked = masked_positions.size()
+            num_masked = masked_positions.size(1)
             gathered_output = torch.gather(
                 sequence_output,
                 dim=1,
@@ -464,11 +479,10 @@ class BasketBERT4Rec(nn.Module):
             
             # Get prediction scores
             prediction_scores = self.output_layer(gathered_output)
+            return prediction_scores
         else:
-            # Get prediction scores for all positions
-            prediction_scores = self.output_layer(sequence_output)
-        
-        return prediction_scores
+            # Return the full sequence output for further processing
+            return sequence_output
     
     def get_item_embeddings(self):
         """Return the item embeddings weight matrix."""
@@ -484,23 +498,6 @@ class BasketBERT4RecDataset(Dataset):
                  mode='mlm', max_mask_len=10):
         """
         Initialize the dataset.
-        
-        Args:
-            sequences: Tensor of shape [num_seqs, seq_length, basket_size]
-                containing item IDs for each basket.
-            sequence_masks: Tensor of shape [num_seqs, seq_length]
-                with 1s for valid baskets and 0s for padding.
-            basket_masks: Tensor of shape [num_seqs, seq_length, basket_size]
-                with 1s for valid items and 0s for padding.
-            masked_positions: List of lists containing indices of masked positions.
-            masked_labels: List of lists containing original basket values at masked positions.
-            targets_padded: Tensor of shape [num_seqs, basket_size]
-                containing item IDs for the target basket (next basket prediction).
-            targets_multihot: Tensor of shape [num_seqs, vocab_size]
-                containing multi-hot encoding of the target basket.
-            mode: Training mode - 'mlm' for masked language modeling, 
-                'next_basket' for next basket prediction.
-            max_mask_len: Maximum number of masked positions to handle in a batch
         """
         self.sequences = sequences
         self.sequence_masks = sequence_masks
@@ -563,83 +560,650 @@ class BasketBERT4RecDataset(Dataset):
                 masked_positions = torch.zeros(1, dtype=torch.long)
                 masked_labels = torch.zeros((1, self.basket_size), dtype=torch.long)
             
+            # Ensure masked_labels are correctly sized even if empty
+            if masked_positions.size(0) > 0 and masked_labels.size(0) == 0:  # if positions exist but labels are empty
+                masked_labels = torch.zeros((masked_positions.size(0), self.basket_size), dtype=torch.long)
+
             return {
                 'sequences': self.sequences[idx],
                 'sequence_masks': self.sequence_masks[idx],
                 'basket_masks': self.basket_masks[idx],
                 'masked_positions': masked_positions,
                 'masked_labels': masked_labels,
-                'num_masks': len(masked_positions)  # Store actual number of masks
+                'num_masks': masked_positions.size(0) if masked_positions is not None else 0
             }
         
         elif self.mode == 'next_basket':
+            item_target_padded = None
+            if self.targets_padded is not None:
+                item_target_padded = self.targets_padded[idx]
+            # else: item_target_padded remains None, or handle error if it's critical
+
+            item_target_multihot = None
+            if self.targets_multihot is not None:  # Check if the dataset attribute is not None
+                item_target_multihot = self.targets_multihot[idx]  # Then access it
+            
             return {
                 'sequences': self.sequences[idx],
                 'sequence_masks': self.sequence_masks[idx],
                 'basket_masks': self.basket_masks[idx],
-                'target_padded': self.targets_padded[idx],
-                'target_multihot': self.targets_multihot[idx]
+                'target_padded': item_target_padded,  # Use the potentially None value
+                'target_multihot': item_target_multihot  # This can be None
             }
 
 
 def custom_collate_fn(batch):
     """
-    Custom collate function to handle variable-length masked positions.
-    
-    Args:
-        batch: List of dictionaries from __getitem__
-        
-    Returns:
-        Batched tensors with consistent sizes
+    Custom collate function to handle variable-length masked positions and potential None values.
     """
+    if not batch: # Handle empty batch
+        return {}
+
     # Determine max number of masked positions in this batch
-    max_masks = max([item['num_masks'] for item in batch]) if 'num_masks' in batch[0] else 0
-    
-    # Initialize batch dictionary
+    # Ensure 'num_masks' key exists and items are not None before trying to access it.
+    max_masks = 0
+    # Check if the first item exists and has 'num_masks'
+    if batch[0] and 'num_masks' in batch[0] and batch[0]['num_masks'] is not None:
+        valid_num_masks = [item.get('num_masks', 0) for item in batch if item is not None and item.get('num_masks') is not None]
+        if valid_num_masks:
+            max_masks = max(valid_num_masks)
+        # If all num_masks are None or items are None, max_masks remains 0
+
     batch_dict = {}
     
-    # Process each key in the batch
-    for key in batch[0].keys():
-        if key == 'masked_positions':
-            # Pad masked positions to the same length
-            padded_positions = []
-            for item in batch:
-                pos = item['masked_positions']
-                if len(pos) < max_masks:
-                    # Pad with zeros
-                    padding = torch.zeros(max_masks - len(pos), dtype=pos.dtype)
-                    pos = torch.cat([pos, padding])
-                elif len(pos) > max_masks:
-                    # Truncate if too long (shouldn't happen with our num_masks tracking)
-                    pos = pos[:max_masks]
-                padded_positions.append(pos)
-            
-            batch_dict[key] = torch.stack(padded_positions)
-            
-        elif key == 'masked_labels':
-            # Pad masked labels to the same length
-            padded_labels = []
-            for item in batch:
-                labels = item['masked_labels']
-                if len(labels) < max_masks:
-                    # Create padding: [max_masks - len(labels), basket_size]
-                    padding = torch.zeros(
-                        (max_masks - len(labels), labels.size(1)), 
-                        dtype=labels.dtype
-                    )
-                    labels = torch.cat([labels, padding], dim=0)
-                elif len(labels) > max_masks:
-                    # Truncate if too long
-                    labels = labels[:max_masks]
-                padded_labels.append(labels)
-            
-            batch_dict[key] = torch.stack(padded_labels)
-            
-        elif key != 'num_masks':  # Skip num_masks as it was just for processing
-            # Standard handling for other keys
-            batch_dict[key] = torch.stack([item[key] for item in batch])
-    
+    # Assuming all items in the batch should have the same keys as the first valid item
+    first_valid_item = next((item for item in batch if item is not None), None)
+    if not first_valid_item: # All items in batch are None
+        return {}
+
+    for key in first_valid_item.keys():
+        if key == 'num_masks': # Already processed or not needed in final batch
+            continue
+
+        all_items_for_key = [item.get(key) for item in batch if item is not None]
+
+        if not all_items_for_key: # All items were None or key was missing for all
+            batch_dict[key] = None
+            continue
+
+        if all(x is None for x in all_items_for_key):
+            batch_dict[key] = None
+            continue
+        
+        # If there's a mix of None and non-None, and it's not a special padding key
+        if any(x is None for x in all_items_for_key) and key not in ['masked_positions', 'masked_labels']:
+            print(f"Warning: Mixed None and Tensor values for key '{key}' in batch. Setting to None for this batch.")
+            batch_dict[key] = None
+            continue
+
+        try:
+            if key == 'masked_positions':
+                padded_positions = []
+                for item_val in all_items_for_key:
+                    pos = item_val if item_val is not None else torch.zeros(0, dtype=torch.long)
+                    current_len = pos.size(0) if pos.dim() > 0 else 0
+                    if current_len < max_masks:
+                        padding = torch.zeros(max_masks - current_len, dtype=pos.dtype, device=pos.device if pos.numel() > 0 else 'cpu')
+                        pos = torch.cat([pos, padding]) if current_len > 0 else padding
+                    elif current_len > max_masks:
+                        pos = pos[:max_masks]
+                    padded_positions.append(pos)
+                batch_dict[key] = torch.stack(padded_positions) if padded_positions else torch.empty(0, dtype=torch.long)
+
+            elif key == 'masked_labels':
+                padded_labels = []
+                basket_s = 1 
+                first_valid_label = next((val for val in all_items_for_key if val is not None and val.ndim > 1 and val.shape[0] > 0), None)
+                if first_valid_label is not None:
+                    basket_s = first_valid_label.size(1)
+                else:
+                    first_valid_seq = first_valid_item.get('sequences')
+                    if first_valid_seq is not None and first_valid_seq.ndim == 3:
+                        basket_s = first_valid_seq.size(2)
+                if basket_s == 0 : basket_s = 1 # Ensure basket_s is at least 1
+
+                for item_val in all_items_for_key:
+                    labels = item_val if item_val is not None else torch.zeros((0, basket_s), dtype=torch.long)
+                    current_len = labels.size(0) if labels.dim() > 0 else 0
+                    
+                    actual_basket_s = labels.size(1) if labels.ndim > 1 and labels.size(1) > 0 else basket_s
+                    if actual_basket_s == 0: actual_basket_s = basket_s # Fallback
+
+                    if labels.ndim == 1 and current_len > 0 and actual_basket_s > 0 :
+                         labels = labels.unsqueeze(1).expand(-1, actual_basket_s)
+                    
+                    if current_len < max_masks:
+                        padding_shape = (max_masks - current_len, actual_basket_s)
+                        if padding_shape[0] >= 0 and padding_shape[1] > 0: # Ensure padding dimensions are valid
+                            padding = torch.zeros(padding_shape, dtype=labels.dtype, device=labels.device if labels.numel() > 0 else 'cpu')
+                            labels = torch.cat([labels, padding], dim=0) if current_len > 0 else padding
+                        elif current_len == 0 and max_masks > 0 and padding_shape[1] > 0:
+                            labels = torch.zeros((max_masks, padding_shape[1]), dtype=torch.long, device=labels.device if labels.numel() > 0 else 'cpu')
+                    elif current_len > max_masks:
+                        labels = labels[:max_masks]
+                    
+                    # Ensure all labels have consistent second dimension before appending
+                    if labels.ndim == 2 and labels.size(1) != basket_s and padded_labels and padded_labels[0].ndim == 2:
+                         # Attempt to conform or warn; for now, let's assume it should be basket_s
+                         if labels.size(1) == 0 and basket_s > 0: # if it became [N,0]
+                             labels = torch.zeros((labels.size(0), basket_s), dtype=labels.dtype, device=labels.device)
+
+                    padded_labels.append(labels)
+                
+                if padded_labels:
+                    # Check for consistent shapes before stacking
+                    ref_shape = None
+                    all_same_shape = True
+                    for lbl in padded_labels:
+                        if lbl.numel() == 0 and max_masks > 0 and basket_s > 0: # Handle completely empty labels that should have shape
+                            lbl_to_check = torch.zeros((max_masks, basket_s), dtype=lbl.dtype, device=lbl.device)
+                        else:
+                            lbl_to_check = lbl
+
+                        if ref_shape is None and lbl_to_check.numel() > 0:
+                            ref_shape = lbl_to_check.shape
+                        if lbl_to_check.numel() > 0 and lbl_to_check.shape != ref_shape:
+                            all_same_shape = False
+                            break
+                    
+                    if all_same_shape or not any(lbl.numel() > 0 for lbl in padded_labels): # Stack if all same or all empty
+                        # Ensure even empty labels are shaped correctly if max_masks > 0
+                        processed_padded_labels = []
+                        for lbl in padded_labels:
+                            if lbl.numel() == 0 and max_masks > 0 and basket_s > 0:
+                                processed_padded_labels.append(torch.zeros((max_masks, basket_s), dtype=torch.long, device=lbl.device if hasattr(lbl, 'device') else 'cpu'))
+                            elif lbl.ndim == 2 and lbl.shape[0] == max_masks and lbl.shape[1] == basket_s:
+                                 processed_padded_labels.append(lbl)
+                            elif lbl.ndim == 2 and lbl.shape[0] == max_masks and basket_s > 0 : # if basket size was inferred differently but length is ok
+                                 # This case is tricky, might need to pad/truncate the basket dim or error
+                                 # For now, if it's going to fail stack, let it, or pad to common basket_s
+                                 if lbl.size(1) < basket_s:
+                                     padding_basket = torch.zeros((max_masks, basket_s - lbl.size(1)), dtype=lbl.dtype, device=lbl.device)
+                                     processed_padded_labels.append(torch.cat((lbl, padding_basket), dim=1))
+                                 elif lbl.size(1) > basket_s:
+                                     processed_padded_labels.append(lbl[:, :basket_s])
+                                 else:
+                                     processed_padded_labels.append(lbl) # Should be fine
+                            else: # Fallback for unexpected shapes
+                                 processed_padded_labels.append(torch.zeros((max_masks, basket_s), dtype=torch.long, device=lbl.device if hasattr(lbl, 'device') else 'cpu'))
+
+
+                        if all(isinstance(l, torch.Tensor) for l in processed_padded_labels):
+                            try:
+                                batch_dict[key] = torch.stack(processed_padded_labels)
+                            except RuntimeError as e:
+                                print(f"Error stacking '{key}': {e}. Shapes: {[l.shape for l in processed_padded_labels]}. Setting to None.")
+                                batch_dict[key] = None
+                        else:
+                            print(f"Not all items for '{key}' are tensors after processing. Setting to None.")
+                            batch_dict[key] = None
+
+                    else: # Shapes are different and not all empty
+                        print(f"Warning: Could not stack '{key}' due to shape mismatch. Shapes: {[lbl.shape for lbl in padded_labels]}. Setting to None.")
+                        batch_dict[key] = None
+                else: # padded_labels is empty
+                    batch_dict[key] = torch.empty((0, max_masks, basket_s) if max_masks > 0 and basket_s > 0 else (0), dtype=torch.long)
+
+            else: # Standard handling for other keys
+                # Ensure all items are tensors before stacking
+                if all(isinstance(x, torch.Tensor) for x in all_items_for_key):
+                    batch_dict[key] = torch.stack(all_items_for_key)
+                else:
+                    # This is where the original error likely happened for 'target_multihot' etc.
+                    print(f"Error: Not all items for key '{key}' are Tensors. Found types: {[type(x) for x in all_items_for_key]}. Setting to None.")
+                    batch_dict[key] = None
+        
+        except TypeError as te:
+            print(f"TypeError during processing for key '{key}': {te}. Values: {[type(v) for v in all_items_for_key]}. Setting to None.")
+            batch_dict[key] = None
+        except RuntimeError as re:
+            print(f"RuntimeError during processing for key '{key}': {re}. Values: {[v.shape if isinstance(v, torch.Tensor) else type(v) for v in all_items_for_key]}. Setting to None.")
+            batch_dict[key] = None
+
     return batch_dict
+
+
+def load_data_for_training(data_dir):
+    """
+    Load preprocessed data for training.
+    
+    Args:
+        data_dir: Directory containing preprocessed data files.
+    
+    Returns:
+        config: Model configuration
+        train_dataset: Training dataset
+        val_dataset: Validation dataset
+        test_dataset: Test dataset
+    """
+    print(f"Loading data from {data_dir}...")
+    
+    # Load metadata
+    with open(os.path.join(data_dir, 'metadata.json'), 'r') as f:
+        metadata = json.load(f)
+    
+    # Load vocabulary
+    try:
+        with open(os.path.join(data_dir, 'vocabulary.json'), 'r') as f:
+            vocab = json.load(f)
+    except:
+        # If vocabulary.json doesn't exist, use vocab info from metadata
+        vocab = {
+            'vocab_size': metadata['vocab_size'],
+            'pad_token': metadata['pad_token'],
+            'mask_token': metadata['mask_token']
+        }
+    
+    # Create model config
+    config = BasketBERT4RecConfig(
+        vocab_size=vocab['vocab_size'],
+        max_position_embeddings=metadata['max_seq_length'],
+        max_basket_size=metadata['max_basket_size'],
+        pad_token_id=vocab['pad_token'],
+        mask_token_id=vocab['mask_token']
+    )
+    
+    # Load training data
+    train_sequences = np.load(os.path.join(data_dir, 'train/sequences.npy'))
+    train_sequence_masks = np.load(os.path.join(data_dir, 'train/sequence_masks.npy'))
+    
+    # Try to load basket masks, if available
+    try:
+        train_basket_masks = np.load(os.path.join(data_dir, 'train/basket_masks.npy'))
+    except:
+        # If basket masks aren't available, create them (1 for items, 0 for padding)
+        train_basket_masks = np.ones_like(train_sequences)
+        train_basket_masks[train_sequences == config.pad_token_id] = 0
+    
+    train_targets_padded = np.load(os.path.join(data_dir, 'train/targets_padded.npy'))
+    
+    # Try to load multihot targets or create them on the fly during training
+    try:
+        train_targets_multihot = np.load(os.path.join(data_dir, 'train/targets_multihot.npy'))
+    except:
+        # We'll handle this in the dataset
+        train_targets_multihot = None
+    
+    # Load masked positions and labels
+    try:
+        with open(os.path.join(data_dir, 'train/masked_positions.pkl'), 'rb') as f:
+            train_masked_positions = pickle.load(f)
+        
+        with open(os.path.join(data_dir, 'train/masked_labels.pkl'), 'rb') as f:
+            train_masked_labels = pickle.load(f)
+    except:
+        # If masked data isn't available, we'll create it dynamically
+        print("Masked positions/labels not found. Will create masks dynamically during training.")
+        train_masked_positions = None
+        train_masked_labels = None
+    
+    # Create training dataset
+    train_dataset = BasketBERT4RecDataset(
+        sequences=train_sequences,
+        sequence_masks=train_sequence_masks,
+        basket_masks=train_basket_masks,
+        masked_positions=train_masked_positions,
+        masked_labels=train_masked_labels,
+        targets_padded=train_targets_padded,
+        targets_multihot=train_targets_multihot,
+        mode='mlm'  # Use MLM for pre-training
+    )
+    
+    # Load validation data if available
+    if os.path.exists(os.path.join(data_dir, 'val')):
+        val_sequences = np.load(os.path.join(data_dir, 'val/sequences.npy'))
+        val_sequence_masks = np.load(os.path.join(data_dir, 'val/sequence_masks.npy'))
+        
+        # Try to load basket masks, if available
+        try:
+            val_basket_masks = np.load(os.path.join(data_dir, 'val/basket_masks.npy'))
+        except:
+            # If basket masks aren't available, create them
+            val_basket_masks = np.ones_like(val_sequences)
+            val_basket_masks[val_sequences == config.pad_token_id] = 0
+        
+        val_targets_padded = np.load(os.path.join(data_dir, 'val/targets_padded.npy'))
+        
+        # Try to load multihot targets
+        try:
+            val_targets_multihot = np.load(os.path.join(data_dir, 'val/targets_multihot.npy'))
+        except:
+            val_targets_multihot = None
+        
+        # Load masked positions and labels
+        try:
+            with open(os.path.join(data_dir, 'val/masked_positions.pkl'), 'rb') as f:
+                val_masked_positions = pickle.load(f)
+            
+            with open(os.path.join(data_dir, 'val/masked_labels.pkl'), 'rb') as f:
+                val_masked_labels = pickle.load(f)
+        except:
+            val_masked_positions = None
+            val_masked_labels = None
+        
+        # Create validation dataset
+        val_dataset = BasketBERT4RecDataset(
+            sequences=val_sequences,
+            sequence_masks=val_sequence_masks,
+            basket_masks=val_basket_masks,
+            masked_positions=val_masked_positions,
+            masked_labels=val_masked_labels,
+            targets_padded=val_targets_padded,
+            targets_multihot=val_targets_multihot,
+            mode='mlm'  # Use MLM for validation
+        )
+    else:
+        val_dataset = None
+    
+    # Load test data if available (for final evaluation)
+    test_dataset = None
+    if os.path.exists(os.path.join(data_dir, 'test')):
+        try:
+            test_sequences = np.load(os.path.join(data_dir, 'test/sequences.npy'))
+            test_sequence_masks = np.load(os.path.join(data_dir, 'test/sequence_masks.npy'))
+            
+            # Try to load basket masks, if available
+            try:
+                test_basket_masks = np.load(os.path.join(data_dir, 'test/basket_masks.npy'))
+            except:
+                # If basket masks aren't available, create them
+                test_basket_masks = np.ones_like(test_sequences)
+                test_basket_masks[test_sequences == config.pad_token_id] = 0
+            
+            test_targets_padded = np.load(os.path.join(data_dir, 'test/targets_padded.npy'))
+            
+            # Try to load multihot targets
+            try:
+                test_targets_multihot = np.load(os.path.join(data_dir, 'test/targets_multihot.npy'))
+            except:
+                test_targets_multihot = None
+            
+            # Create test dataset
+            test_dataset = BasketBERT4RecDataset(
+                sequences=test_sequences,
+                sequence_masks=test_sequence_masks,
+                basket_masks=test_basket_masks,
+                targets_padded=test_targets_padded,
+                targets_multihot=test_targets_multihot,
+                mode='next_basket'  # Use next basket prediction for testing
+            )
+        except Exception as e:
+            print(f"Error loading test data: {e}")
+            test_dataset = None
+    
+    print(f"Data loaded: {len(train_dataset)} training examples, ", end="")
+    print(f"{len(val_dataset) if val_dataset else 0} validation examples, ", end="")
+    print(f"{len(test_dataset) if test_dataset else 0} test examples")
+    
+    return config, train_dataset, val_dataset, test_dataset
+
+
+def evaluate(predictions_sigmoid, targets, k_list=[5, 10, 15, 20]):
+    """
+    Evaluate next basket prediction performance using Precision@k, Recall@k, and Hit@k.
+    
+    Args:
+        predictions_sigmoid: List of tensors with sigmoid scores for items
+        targets: List of lists containing true item IDs
+        k_list: List of k values for evaluation
+    
+    Returns:
+        Dictionary of evaluation metrics
+    """
+    all_preds = torch.cat(predictions_sigmoid, dim=0)  # (num_samples, vocab_size)
+    num_samples = all_preds.size(0)
+ 
+    metrics = {f'precision@{k}': 0.0 for k in k_list}
+    metrics.update({f'recall@{k}': 0.0 for k in k_list})
+    metrics.update({f'hit@{k}': 0.0 for k in k_list})
+ 
+    # Convert targets to set for faster intersection operations
+    targets_set = [set(t) for t in targets]
+ 
+    # Get top-k predictions for all k in k_list
+    max_k = max(k_list)
+    topk_preds = torch.topk(all_preds, k=max_k, dim=1).indices.cpu().numpy()  # (num_samples, max_k)
+ 
+    for i in range(num_samples):
+        true_items = targets_set[i]
+        if not true_items:
+            continue  # skip if no ground truth
+ 
+        for k in k_list:
+            pred_k = set(topk_preds[i, :k].tolist())
+            hits = true_items.intersection(pred_k)
+            hit_count = len(hits)
+ 
+            metrics[f'precision@{k}'] += hit_count / k
+            metrics[f'recall@{k}'] += hit_count / len(true_items)
+            metrics[f'hit@{k}'] += 1.0 if hit_count > 0 else 0.0
+ 
+    for k in k_list:
+        metrics[f'precision@{k}'] /= num_samples
+        metrics[f'recall@{k}'] /= num_samples
+        metrics[f'hit@{k}'] /= num_samples
+ 
+    return metrics
+
+
+def evaluate_model(model, test_dataset, device):
+    """
+    Evaluate the model on test dataset.
+    
+    Args:
+        model: BasketBERT4Rec model
+        test_dataset: Test dataset
+        device: Device to run evaluation on
+        
+    Returns:
+        Dictionary of evaluation metrics
+    """
+    model.eval()
+    
+    # Create dataloader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=32, # Consider using a larger batch size for evaluation if memory allows
+        shuffle=False,
+        collate_fn=custom_collate_fn,
+        num_workers=0 # Keep 0 for Windows, can be >0 on Linux/macOS
+    )
+    
+    # Store predictions and targets
+    all_predictions_sigmoid = [] # Renamed to avoid conflict with 'predictions' variable later
+    all_targets = []
+    
+    with torch.no_grad():
+        for batch_data in tqdm(test_loader, desc="Evaluating"): # Renamed batch to batch_data
+            # Move batch to device, checking for None values
+            batch = {}
+            if batch_data is None: # Should not happen if collate_fn returns {} for empty batch
+                print("Warning: Received None batch from DataLoader. Skipping.")
+                continue
+            for k, v in batch_data.items(): # Use batch_data here
+                if v is not None:
+                    batch[k] = v.to(device)
+                else:
+                    batch[k] = None # Keep it as None if it was None from collate_fn
+            
+            # Get inputs, checking if they exist in the batch and are not None
+            sequences = batch.get('sequences')
+            sequence_masks = batch.get('sequence_masks')
+            basket_masks = batch.get('basket_masks')
+            targets_padded_batch = batch.get('target_padded') # Renamed to avoid conflict
+
+            if sequences is None or sequence_masks is None or targets_padded_batch is None:
+                print(f"Warning: Missing critical data in batch (sequences, sequence_masks, or target_padded are None). Skipping batch.")
+                continue
+            
+            # Forward pass to get all outputs
+            # Ensure basket_masks is passed if model expects it, otherwise handle its absence
+            all_outputs = model(sequences, basket_masks=basket_masks, sequence_mask=sequence_masks)
+            
+            # Get the last valid basket embedding
+            # Ensure sequence_masks is not all zeros to prevent negative indices
+            valid_lengths = sequence_masks.sum(dim=1)
+            if (valid_lengths == 0).any():
+                print("Warning: Batch contains sequences with zero length. Skipping these.")
+                # Filter out zero-length sequences if necessary, or handle carefully
+                # For now, this might lead to issues if not handled before gather
+            
+            last_positions = valid_lengths - 1
+            # Clamp last_positions to be non-negative
+            last_positions = torch.clamp(last_positions, min=0).unsqueeze(1)  # [batch_size, 1]
+            
+            # Gather last position outputs
+            batch_size_current = sequences.size(0) # Use current batch_size
+            hidden_size = all_outputs.size(-1)
+            
+            # Ensure last_positions are within bounds of all_outputs.shape[1]
+            if last_positions.max() >= all_outputs.shape[1]:
+                print(f"Warning: last_positions out of bounds. Max pos: {last_positions.max()}, Seq len: {all_outputs.shape[1]}. Clamping.")
+                last_positions = torch.clamp(last_positions, max=all_outputs.shape[1]-1)
+
+
+            last_outputs = torch.gather(
+                all_outputs,
+                dim=1,
+                index=last_positions.unsqueeze(-1).expand(-1, -1, hidden_size)
+            ).squeeze(1)  # [batch_size, hidden_size]
+            
+            # Predict next basket
+            next_basket_logits = model.output_layer(last_outputs)  # [batch_size, vocab_size]
+            predictions_sigmoid_batch = torch.sigmoid(next_basket_logits) # Renamed
+            
+            all_predictions_sigmoid.append(predictions_sigmoid_batch)
+            
+            # Convert targets to list of non-padding items
+            batch_targets_list = [] # Renamed
+            for i in range(batch_size_current):
+                # Ensure targets_padded_batch[i] is a tensor and not None
+                current_target_padded = targets_padded_batch[i]
+                if current_target_padded is not None:
+                    # Filter out padding tokens (usually 0) and special tokens if any
+                    # Assuming pad_token_id is 0. Adjust if different.
+                    valid_items = current_target_padded[current_target_padded > 0].cpu().tolist()
+                    batch_targets_list.append(valid_items)
+                else:
+                    batch_targets_list.append([]) # Append empty list if target is None for this item
+            
+            all_targets.extend(batch_targets_list)
+    
+    # Evaluate using our metrics
+    # Ensure all_predictions_sigmoid is not empty before cat and evaluation
+    if not all_predictions_sigmoid:
+        print("Warning: No predictions were made during evaluation. Returning empty metrics.")
+        return {f'precision@{k}': 0.0 for k in [5, 10, 15, 20]} # Return default empty metrics
+        
+    metrics = evaluate(all_predictions_sigmoid, all_targets, k_list=[5, 10, 15, 20])
+    
+    return metrics
+
+
+def train_model(data_dir='./bert4rec_data/', output_dir='./bert4rec_model/',
+                batch_size=32, num_epochs=5, learning_rate=0.001,
+                use_gpu=True):
+    """
+    Train the model using the prepared data.
+    
+    Args:
+        data_dir: Path to directory with prepared data
+        output_dir: Path to save model outputs
+        batch_size: Batch size for training
+        num_epochs: Number of training epochs
+        learning_rate: Learning rate for optimizer
+        use_gpu: Whether to use GPU if available
+        
+    Returns:
+        Trained model and trainer object
+    """
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    
+    # Use the first available CUDA device if available
+    if torch.cuda.is_available() and use_gpu:
+        device = torch.device('cuda:0')
+        print(f"Using NVIDIA GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device('cpu')
+        print(f"Using device: CPU")
+    
+    # Load data for training
+    config, train_dataset, val_dataset, test_dataset = load_data_for_training(data_dir)
+    
+    # Create model
+    model = BasketBERT4Rec(config)
+    
+    # Create trainer
+    trainer = BasketBERT4RecTrainer(
+        model=model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        batch_size=batch_size,
+        lr=learning_rate,
+        weight_decay=0.05,        # Increased from 0.01
+        num_epochs=num_epochs,
+        device=device,
+        output_dir=output_dir,
+        mlm_weight=1.5,           # Increased from 1.0
+        nbr_weight=0.5            # Decreased from 1.0
+    )
+    
+    # Train model
+    training_metrics = trainer.train()
+    
+    # Save item embeddings
+    item_embeddings = model.get_item_embeddings().cpu().numpy()
+    np.save(os.path.join(output_dir, 'item_embeddings.npy'), item_embeddings)
+    
+    # Save final model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': model.config.__dict__
+    }, os.path.join(output_dir, 'final_model.pt'))
+    
+    print(f"Training completed! Model saved to {output_dir}")
+    
+    # Create a test set from validation set if needed
+    if test_dataset is None and val_dataset is not None:
+        print("Creating test set from validation set...")
+        val_indices = range(len(val_dataset))
+        # Ensure test_size is valid if val_dataset is small
+        test_split_size = min(0.5, (len(val_dataset) - 1) / len(val_dataset)) if len(val_dataset) > 1 else 0
+        if test_split_size > 0:
+            _, test_indices = train_test_split(val_indices, test_size=test_split_size, random_state=42)
+
+            # Create test dataset using attributes from val_dataset
+            test_dataset = BasketBERT4RecDataset(
+                sequences=val_dataset.sequences[test_indices],
+                sequence_masks=val_dataset.sequence_masks[test_indices],
+                basket_masks=val_dataset.basket_masks[test_indices],
+                targets_padded=val_dataset.targets_padded[test_indices],
+                # Handle potential numpy array or None for multihot
+                targets_multihot=(val_dataset.targets_multihot[test_indices]
+                                if isinstance(val_dataset.targets_multihot, np.ndarray)
+                                else None),
+                mode='next_basket'  # Set mode for evaluation
+            )
+            print(f"Test set created with {len(test_dataset)} examples")
+        else:
+            print("Validation set too small to create a test set.")
+            test_dataset = None  # Ensure test_dataset remains None
+    
+    # Evaluate model on test set
+    if test_dataset:
+        print("\nEvaluating model on test set...")
+        test_metrics = evaluate_model(model, test_dataset, device)
+        
+        print("\nTest Metrics:")
+        for k, v in test_metrics.items():
+            print(f"  {k}: {v:.4f}")
+    
+    # Return model and trainer for further analysis
+    return model, trainer, test_metrics
 
 
 class BasketBERT4RecTrainer:
@@ -647,8 +1211,8 @@ class BasketBERT4RecTrainer:
     
     def __init__(self, model, train_dataset, val_dataset=None, 
                  batch_size=32, lr=0.001, weight_decay=0.01,
-                 num_epochs=10, device='cuda', output_dir='./model_output/',
-                 mlm_weight=1.0, nbr_weight=1.0):
+                 num_epochs=5, device='cuda', output_dir='./model_output/',
+                 mlm_weight=1.5, nbr_weight=0.5):
         """
         Initialize the trainer.
         
@@ -684,7 +1248,7 @@ class BasketBERT4RecTrainer:
             batch_size=batch_size, 
             shuffle=True,
             collate_fn=custom_collate_fn,
-            num_workers=2,
+            num_workers=0, # Set to 0 for Windows, can be >0 on Linux/macOS
             pin_memory=True if device == 'cuda' else False
         )
         
@@ -694,7 +1258,7 @@ class BasketBERT4RecTrainer:
                 batch_size=batch_size, 
                 shuffle=False,
                 collate_fn=custom_collate_fn,
-                num_workers=2,
+                num_workers=0, # Set to 0 for Windows
                 pin_memory=True if device == 'cuda' else False
             )
         else:
@@ -712,7 +1276,7 @@ class BasketBERT4RecTrainer:
             self.optimizer, 
             mode='min', 
             factor=0.5,
-            patience=2,
+            patience=2, # Number of epochs with no improvement after which learning rate will be reduced.
             min_lr=1e-6
         )
         
@@ -722,19 +1286,25 @@ class BasketBERT4RecTrainer:
         # Initialize training state
         self.best_val_loss = float('inf')
         self.no_improve_epochs = 0
-        self.early_stop_patience = 5
+        self.early_stop_patience = 5 # Number of epochs with no improvement on validation loss to trigger early stopping
     
     def train(self):
         """Train the model for the specified number of epochs."""
         print(f"Starting training for {self.num_epochs} epochs...")
+        all_train_metrics = []
+        all_val_metrics = []
         
         for epoch in range(self.num_epochs):
             # Training phase
-            train_loss, train_metrics = self._train_epoch(epoch)
+            train_loss, train_epoch_metrics = self._train_epoch(epoch)
+            all_train_metrics.append({'loss': train_loss, **train_epoch_metrics})
             
             # Validation phase
+            val_loss_for_epoch = None
             if self.val_loader:
-                val_loss, val_metrics = self._validate_epoch(epoch)
+                val_loss, val_epoch_metrics = self._validate_epoch(epoch)
+                all_val_metrics.append({'loss': val_loss, **val_epoch_metrics})
+                val_loss_for_epoch = val_loss
                 
                 # Learning rate scheduling
                 self.scheduler.step(val_loss)
@@ -748,169 +1318,172 @@ class BasketBERT4RecTrainer:
                 else:
                     self.no_improve_epochs += 1
                     if self.no_improve_epochs >= self.early_stop_patience:
-                        print(f"Early stopping at epoch {epoch+1}")
+                        print(f"Early stopping at epoch {epoch+1} due to no improvement in validation loss for {self.early_stop_patience} epochs.")
                         break
             
-            # Always save the latest model
+            # Always save the latest model (can be configured)
             self._save_model(f'model_epoch_{epoch+1}.pt')
             
             # Print epoch summary
-            print(f"Epoch {epoch+1}/{self.num_epochs} - Train Loss: {train_loss:.4f}, ", end="")
-            if self.val_loader:
-                print(f"Val Loss: {val_loss:.4f}")
-            else:
-                print("")
-        
+            print(f"Epoch {epoch+1}/{self.num_epochs} - Train Loss: {train_loss:.4f}", end="")
+            if val_loss_for_epoch is not None:
+                print(f", Val Loss: {val_loss_for_epoch:.4f}", end="")
+            print(f", LR: {self.optimizer.param_groups[0]['lr']:.1e}")
+            # Optionally print more metrics from train_epoch_metrics and val_epoch_metrics
+            if 'mlm_accuracy' in train_epoch_metrics:
+                 print(f"  Train MLM Acc: {train_epoch_metrics['mlm_accuracy']:.4f}", end="")
+            if 'recall' in train_epoch_metrics: # Assuming recall is recall@10
+                 print(f", Train NBR Rec@10: {train_epoch_metrics['recall']:.4f}", end="")
+            if self.val_loader and 'mlm_accuracy' in val_epoch_metrics:
+                 print(f" | Val MLM Acc: {val_epoch_metrics['mlm_accuracy']:.4f}", end="")
+            if self.val_loader and 'recall' in val_epoch_metrics:
+                 print(f", Val NBR Rec@10: {val_epoch_metrics['recall']:.4f}", end="")
+            print("")
+
+
         print("Training completed!")
         
-        # Return metrics for evaluation
+        # Return metrics for evaluation (e.g., metrics of the last epoch or best epoch)
+        # For simplicity, returning metrics of the last completed epoch
+        final_train_metrics = all_train_metrics[-1] if all_train_metrics else {}
+        final_val_metrics = all_val_metrics[-1] if all_val_metrics else {}
+
         return {
-            'train_loss': train_loss,
-            'train_metrics': train_metrics,
-            'val_loss': val_loss if self.val_loader else None,
-            'val_metrics': val_metrics if self.val_loader else None
+            'train_loss': final_train_metrics.get('loss'),
+            'train_metrics': {k:v for k,v in final_train_metrics.items() if k != 'loss'},
+            'val_loss': final_val_metrics.get('loss'),
+            'val_metrics': {k:v for k,v in final_val_metrics.items() if k != 'loss'}
         }
     
     def _train_epoch(self, epoch):
         """Train for one epoch."""
         self.model.train()
-        total_loss = 0
-        total_mlm_loss = 0
-        total_nbr_loss = 0
+        total_loss_sum = 0.0
+        total_mlm_loss_sum = 0.0
+        total_nbr_loss_sum = 0.0
         num_batches = len(self.train_loader)
         
-        # Track correct predictions for MLM
-        total_mlm_items = 0
-        correct_mlm_items = 0
+        total_mlm_items_epoch = 0
+        correct_mlm_items_epoch = 0
         
-        # Track metrics for next basket prediction
-        total_nbr_items = 0
-        total_recall = 0
+        total_nbr_items_epoch = 0
+        weighted_recall_sum_epoch = 0.0 # For NBR recall (e.g., recall@10 * num_items_in_batch)
         
-        # Progress bar
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} [Train]")
         
-        for batch_idx, batch in enumerate(pbar):
-            # Move batch to device
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+        for batch_idx, batch_data in enumerate(pbar):
+            # Move batch to device, handle None values from collate_fn
+            batch = {k: v.to(self.device) if v is not None else None for k, v in batch_data.items()}
             
-            # Zero gradients
             self.optimizer.zero_grad()
             
-            # Forward pass and loss calculation
-            loss, metrics = self._compute_loss(batch)
+            current_batch_loss, batch_metrics = self._compute_loss(batch)
             
-            # Backward pass
-            loss.backward()
+            if current_batch_loss is not None and torch.isfinite(current_batch_loss):
+                current_batch_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                total_loss_sum += current_batch_loss.item()
+            else:
+                # Skip optimization if loss is None or not finite (e.g. due to empty batch or bad data)
+                print(f"Warning: Skipping batch {batch_idx} in epoch {epoch+1} due to invalid loss: {current_batch_loss}")
+
+
+            # Accumulate metrics from batch_metrics
+            total_mlm_loss_sum += batch_metrics.get('mlm_loss', 0)
+            total_nbr_loss_sum += batch_metrics.get('nbr_loss', 0)
             
-            # Clip gradients
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if 'mlm_correct' in batch_metrics and 'mlm_total' in batch_metrics and batch_metrics['mlm_total'] > 0:
+                total_mlm_items_epoch += batch_metrics['mlm_total']
+                correct_mlm_items_epoch += batch_metrics['mlm_correct']
             
-            # Optimizer step
-            self.optimizer.step()
+            if 'recall' in batch_metrics and 'nbr_total' in batch_metrics and batch_metrics['nbr_total'] > 0:
+                total_nbr_items_epoch += batch_metrics['nbr_total']
+                weighted_recall_sum_epoch += batch_metrics['recall'] * batch_metrics['nbr_total']
             
-            # Update metrics
-            total_loss += loss.item()
-            total_mlm_loss += metrics.get('mlm_loss', 0)
-            total_nbr_loss += metrics.get('nbr_loss', 0)
+            pbar_postfix = {
+                'loss': f"{current_batch_loss.item() if current_batch_loss is not None and torch.isfinite(current_batch_loss) else float('nan'):.4f}",
+                'mlm_l': f"{batch_metrics.get('mlm_loss', 0):.4f}",
+                'nbr_l': f"{batch_metrics.get('nbr_loss', 0):.4f}"
+            }
+            if batch_metrics.get('mlm_total', 0) > 0:
+                pbar_postfix['mlm_acc'] = f"{batch_metrics.get('mlm_accuracy', 0):.2f}"
+            if batch_metrics.get('nbr_total', 0) > 0:
+                 pbar_postfix['nbr_rec'] = f"{batch_metrics.get('recall', 0):.2f}" # recall is recall@10
+            pbar.set_postfix(pbar_postfix)
             
-            if 'mlm_correct' in metrics and 'mlm_total' in metrics:
-                total_mlm_items += metrics['mlm_total']
-                correct_mlm_items += metrics['mlm_correct']
-            
-            if 'recall' in metrics and 'nbr_total' in metrics:
-                total_nbr_items += metrics['nbr_total']
-                total_recall += metrics['recall'] * metrics['nbr_total']
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'mlm_loss': f"{metrics.get('mlm_loss', 0):.4f}",
-                'nbr_loss': f"{metrics.get('nbr_loss', 0):.4f}"
-            })
+        avg_epoch_loss = total_loss_sum / num_batches if num_batches > 0 else 0
+        avg_mlm_loss_epoch = total_mlm_loss_sum / num_batches if num_batches > 0 else 0
+        avg_nbr_loss_epoch = total_nbr_loss_sum / num_batches if num_batches > 0 else 0
         
-        # Calculate epoch metrics
-        avg_loss = total_loss / num_batches
-        avg_mlm_loss = total_mlm_loss / num_batches
-        avg_nbr_loss = total_nbr_loss / num_batches
-        
-        metrics = {
-            'avg_mlm_loss': avg_mlm_loss,
-            'avg_nbr_loss': avg_nbr_loss
+        epoch_metrics_summary = {
+            'avg_mlm_loss': avg_mlm_loss_epoch,
+            'avg_nbr_loss': avg_nbr_loss_epoch,
+            'mlm_accuracy': (correct_mlm_items_epoch / total_mlm_items_epoch) if total_mlm_items_epoch > 0 else 0,
+            'recall': (weighted_recall_sum_epoch / total_nbr_items_epoch) if total_nbr_items_epoch > 0 else 0 # This is avg recall@10
         }
         
-        if total_mlm_items > 0:
-            metrics['mlm_accuracy'] = correct_mlm_items / total_mlm_items
-        
-        if total_nbr_items > 0:
-            metrics['recall'] = total_recall / total_nbr_items
-        
-        return avg_loss, metrics
-    
+        return avg_epoch_loss, epoch_metrics_summary
+
     def _validate_epoch(self, epoch):
         """Validate the model on the validation set."""
         self.model.eval()
-        total_loss = 0
-        total_mlm_loss = 0
-        total_nbr_loss = 0
+        total_loss_sum = 0.0
+        total_mlm_loss_sum = 0.0
+        total_nbr_loss_sum = 0.0
         num_batches = len(self.val_loader)
+
+        total_mlm_items_epoch = 0
+        correct_mlm_items_epoch = 0
         
-        # Track correct predictions for MLM
-        total_mlm_items = 0
-        correct_mlm_items = 0
+        total_nbr_items_epoch = 0
+        weighted_recall_sum_epoch = 0.0
         
-        # Track metrics for next basket prediction
-        total_nbr_items = 0
-        total_recall = 0
-        
-        # Progress bar
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch+1} [Val]")
         
         with torch.no_grad():
-            for batch_idx, batch in enumerate(pbar):
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+            for batch_idx, batch_data in enumerate(pbar):
+                batch = {k: v.to(self.device) if v is not None else None for k, v in batch_data.items()}
                 
-                # Forward pass and loss calculation
-                loss, metrics = self._compute_loss(batch)
+                current_batch_loss, batch_metrics = self._compute_loss(batch)
+
+                if current_batch_loss is not None and torch.isfinite(current_batch_loss):
+                    total_loss_sum += current_batch_loss.item()
+
+                total_mlm_loss_sum += batch_metrics.get('mlm_loss', 0)
+                total_nbr_loss_sum += batch_metrics.get('nbr_loss', 0)
+
+                if 'mlm_correct' in batch_metrics and 'mlm_total' in batch_metrics and batch_metrics['mlm_total'] > 0:
+                    total_mlm_items_epoch += batch_metrics['mlm_total']
+                    correct_mlm_items_epoch += batch_metrics['mlm_correct']
                 
-                # Update metrics
-                total_loss += loss.item()
-                total_mlm_loss += metrics.get('mlm_loss', 0)
-                total_nbr_loss += metrics.get('nbr_loss', 0)
+                if 'recall' in batch_metrics and 'nbr_total' in batch_metrics and batch_metrics['nbr_total'] > 0:
+                    total_nbr_items_epoch += batch_metrics['nbr_total']
+                    weighted_recall_sum_epoch += batch_metrics['recall'] * batch_metrics['nbr_total']
                 
-                if 'mlm_correct' in metrics and 'mlm_total' in metrics:
-                    total_mlm_items += metrics['mlm_total']
-                    correct_mlm_items += metrics['mlm_correct']
-                
-                if 'recall' in metrics and 'nbr_total' in metrics:
-                    total_nbr_items += metrics['nbr_total']
-                    total_recall += metrics['recall'] * metrics['nbr_total']
-                
-                # Update progress bar
-                pbar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
-                    'mlm_loss': f"{metrics.get('mlm_loss', 0):.4f}",
-                    'nbr_loss': f"{metrics.get('nbr_loss', 0):.4f}"
-                })
+                pbar_postfix = {
+                    'loss': f"{current_batch_loss.item() if current_batch_loss is not None and torch.isfinite(current_batch_loss) else float('nan'):.4f}",
+                    'mlm_l': f"{batch_metrics.get('mlm_loss', 0):.4f}",
+                    'nbr_l': f"{batch_metrics.get('nbr_loss', 0):.4f}"
+                }
+                if batch_metrics.get('mlm_total', 0) > 0:
+                    pbar_postfix['mlm_acc'] = f"{batch_metrics.get('mlm_accuracy', 0):.2f}"
+                if batch_metrics.get('nbr_total', 0) > 0:
+                    pbar_postfix['nbr_rec'] = f"{batch_metrics.get('recall', 0):.2f}"
+                pbar.set_postfix(pbar_postfix)
+
+        avg_epoch_loss = total_loss_sum / num_batches if num_batches > 0 else 0
+        avg_mlm_loss_epoch = total_mlm_loss_sum / num_batches if num_batches > 0 else 0
+        avg_nbr_loss_epoch = total_nbr_loss_sum / num_batches if num_batches > 0 else 0
         
-        # Calculate epoch metrics
-        avg_loss = total_loss / num_batches
-        avg_mlm_loss = total_mlm_loss / num_batches
-        avg_nbr_loss = total_nbr_loss / num_batches
-        
-        metrics = {
-            'avg_mlm_loss': avg_mlm_loss,
-            'avg_nbr_loss': avg_nbr_loss
+        epoch_metrics_summary = {
+            'avg_mlm_loss': avg_mlm_loss_epoch,
+            'avg_nbr_loss': avg_nbr_loss_epoch,
+            'mlm_accuracy': (correct_mlm_items_epoch / total_mlm_items_epoch) if total_mlm_items_epoch > 0 else 0,
+            'recall': (weighted_recall_sum_epoch / total_nbr_items_epoch) if total_nbr_items_epoch > 0 else 0
         }
         
-        if total_mlm_items > 0:
-            metrics['mlm_accuracy'] = correct_mlm_items / total_mlm_items
-        
-        if total_nbr_items > 0:
-            metrics['recall'] = total_recall / total_nbr_items
-        
-        return avg_loss, metrics
+        return avg_epoch_loss, epoch_metrics_summary
     
     def _compute_loss(self, batch):
         """
@@ -1107,7 +1680,7 @@ class BasketBERT4RecTrainer:
         )
         
         # Compute recall@k metrics
-        k_values = [5, 10, 20]
+        k_values = [5, 10, 15, 20]
         recall_metrics = {}
         
         # Get top-k predictions
@@ -1193,372 +1766,14 @@ class BasketBERT4RecTrainer:
         }, model_path)
         
         print(f"Model saved to {model_path}")
-    
-    def evaluate(self, test_dataset):
-        """
-        Evaluate the model on a test dataset.
-        
-        Args:
-            test_dataset: Test dataset
-        
-        Returns:
-            metrics: Dictionary of evaluation metrics
-        """
-        test_loader = DataLoader(
-            test_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False,
-            collate_fn=custom_collate_fn,
-            num_workers=2,
-            pin_memory=True if self.device == 'cuda' else False
-        )
-        
-        self.model.eval()
-        total_loss = 0
-        total_items = 0
-        recall_sums = {k: 0 for k in [5, 10, 20]}
-        ndcg_sums = {k: 0 for k in [5, 10, 20]}
-        
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Evaluating"):
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                
-                # Get inputs
-                sequences = batch['sequences']
-                sequence_masks = batch['sequence_masks']
-                basket_masks = batch['basket_masks']
-                
-                # For next basket prediction, we need the targets
-                if 'target_multihot' in batch:
-                    target_multihot = batch['target_multihot']
-                else:
-                    # Convert padded targets to multi-hot
-                    target_padded = batch['target_padded']
-                    batch_size, vocab_size = len(target_padded), self.model.config.vocab_size
-                    
-                    target_multihot = torch.zeros(
-                        batch_size, vocab_size, device=self.device
-                    )
-                    
-                    for b in range(batch_size):
-                        valid_items = target_padded[b][target_padded[b] > 0]
-                        if len(valid_items) > 0:
-                            target_multihot[b, valid_items] = 1.0
-                
-                # Forward pass to get sequence output
-                all_outputs = self.model(sequences, basket_masks, sequence_masks)
-                
-                # Get the last valid basket embedding
-                last_positions = sequence_masks.sum(dim=1) - 1
-                last_positions = last_positions.unsqueeze(1)  # [batch_size, 1]
-                
-                # Gather last position outputs
-                batch_size = sequences.size(0)
-                hidden_size = all_outputs.size(-1)
-                
-                last_outputs = torch.gather(
-                    all_outputs,
-                    dim=1,
-                    index=last_positions.unsqueeze(-1).expand(-1, -1, hidden_size)
-                ).squeeze(1)  # [batch_size, hidden_size]
-                
-                # Predict next basket
-                next_basket_logits = self.model.output_layer(last_outputs)  # [batch_size, vocab_size]
-                
-                # Compute loss
-                bce_loss = F.binary_cross_entropy_with_logits(
-                    next_basket_logits, target_multihot, reduction='mean'
-                )
-                
-                total_loss += bce_loss.item() * batch_size
-                total_items += batch_size
-                
-                # Compute metrics for each example
-                for b in range(batch_size):
-                    # Get ground truth items
-                    true_items = target_multihot[b].nonzero().squeeze(-1)
-                    
-                    if len(true_items) > 0:
-                        # Get relevance scores for all items
-                        relevance = torch.zeros(
-                            self.model.config.vocab_size, device=self.device
-                        )
-                        relevance[true_items] = 1.0
-                        
-                        # Get predictions (scores)
-                        pred_scores = next_basket_logits[b]
-                        
-                        # Compute metrics for different k values
-                        for k in [5, 10, 20]:
-                            # Get top-k predictions
-                            _, top_indices = torch.topk(pred_scores, k=k)
-                            
-                            # Calculate recall@k
-                            top_relevance = relevance[top_indices]
-                            recall = top_relevance.sum() / true_items.size(0)
-                            recall_sums[k] += recall.item()
-                            
-                            # Calculate NDCG@k
-                            dcg = torch.sum(top_relevance / torch.log2(torch.arange(k, device=self.device) + 2))
-                            # Ideal DCG: all true items at the top
-                            idcg = torch.sum(torch.ones(min(k, true_items.size(0)), device=self.device) / 
-                                            torch.log2(torch.arange(min(k, true_items.size(0)), device=self.device) + 2))
-                            
-                            ndcg = dcg / idcg if idcg > 0 else 0
-                            ndcg_sums[k] += ndcg.item()
-        
-        # Calculate average metrics
-        avg_loss = total_loss / total_items
-        avg_recall = {k: recall_sums[k] / total_items for k in recall_sums}
-        avg_ndcg = {k: ndcg_sums[k] / total_items for k in ndcg_sums}
-        
-        metrics = {
-            'loss': avg_loss,
-            **{f'recall@{k}': avg_recall[k] for k in avg_recall},
-            **{f'ndcg@{k}': avg_ndcg[k] for k in avg_ndcg}
-        }
-        
-        print("Evaluation Results:")
-        for metric, value in metrics.items():
-            print(f"  {metric}: {value:.4f}")
-        
-        return metrics
-
-
-def load_data_for_training(data_dir):
-    """
-    Load preprocessed data for training.
-    
-    Args:
-        data_dir: Directory containing preprocessed data files.
-    
-    Returns:
-        config: Model configuration
-        train_dataset: Training dataset
-        val_dataset: Validation dataset
-    """
-    print(f"Loading data from {data_dir}...")
-    
-    # Load metadata
-    with open(os.path.join(data_dir, 'metadata.json'), 'r') as f:
-        metadata = json.load(f)
-    
-    # Load vocabulary
-    try:
-        with open(os.path.join(data_dir, 'vocabulary.json'), 'r') as f:
-            vocab = json.load(f)
-    except:
-        # If vocabulary.json doesn't exist, use vocab info from metadata
-        vocab = {
-            'vocab_size': metadata['vocab_size'],
-            'pad_token': metadata['pad_token'],
-            'mask_token': metadata['mask_token']
-        }
-    
-    # Create model config
-    config = BasketBERT4RecConfig(
-        vocab_size=vocab['vocab_size'],
-        max_position_embeddings=metadata['max_seq_length'],
-        max_basket_size=metadata['max_basket_size'],
-        pad_token_id=vocab['pad_token'],
-        mask_token_id=vocab['mask_token'],
-        # Model architecture hyperparameters
-        hidden_size=128,  # Reduced from 256 to handle smaller datasets/machines
-        num_hidden_layers=2,  # Reduced from 4 for faster training
-        num_attention_heads=4,
-        intermediate_size=512,  # Reduced from 1024
-        hidden_dropout_prob=0.1,
-        attention_probs_dropout_prob=0.1,
-        basket_embedding_type='mean'  # Options: 'mean', 'max', 'attention'
-    )
-    
-    # Load training data
-    train_sequences = np.load(os.path.join(data_dir, 'train/sequences.npy'))
-    train_sequence_masks = np.load(os.path.join(data_dir, 'train/sequence_masks.npy'))
-    
-    # Try to load basket masks, if available
-    try:
-        train_basket_masks = np.load(os.path.join(data_dir, 'train/basket_masks.npy'))
-    except:
-        # If basket masks aren't available, create them (1 for items, 0 for padding)
-        train_basket_masks = np.ones_like(train_sequences)
-        train_basket_masks[train_sequences == config.pad_token_id] = 0
-    
-    train_targets_padded = np.load(os.path.join(data_dir, 'train/targets_padded.npy'))
-    
-    # Try to load multihot targets or create them on the fly during training
-    try:
-        train_targets_multihot = np.load(os.path.join(data_dir, 'train/targets_multihot.npy'))
-    except:
-        # We'll handle this in the dataset
-        train_targets_multihot = None
-    
-    # Load masked positions and labels
-    try:
-        with open(os.path.join(data_dir, 'train/masked_positions.pkl'), 'rb') as f:
-            train_masked_positions = pickle.load(f)
-        
-        with open(os.path.join(data_dir, 'train/masked_labels.pkl'), 'rb') as f:
-            train_masked_labels = pickle.load(f)
-    except:
-        # If masked data isn't available, we'll create it dynamically
-        print("Masked positions/labels not found. Will create masks dynamically during training.")
-        train_masked_positions = None
-        train_masked_labels = None
-    
-    # Create training dataset
-    train_dataset = BasketBERT4RecDataset(
-        sequences=train_sequences,
-        sequence_masks=train_sequence_masks,
-        basket_masks=train_basket_masks,
-        masked_positions=train_masked_positions,
-        masked_labels=train_masked_labels,
-        targets_padded=train_targets_padded,
-        targets_multihot=train_targets_multihot,
-        mode='mlm'  # Use MLM for pre-training
-    )
-    
-    # Load validation data if available
-    if os.path.exists(os.path.join(data_dir, 'val')):
-        val_sequences = np.load(os.path.join(data_dir, 'val/sequences.npy'))
-        val_sequence_masks = np.load(os.path.join(data_dir, 'val/sequence_masks.npy'))
-        
-        # Try to load basket masks, if available
-        try:
-            val_basket_masks = np.load(os.path.join(data_dir, 'val/basket_masks.npy'))
-        except:
-            # If basket masks aren't available, create them
-            val_basket_masks = np.ones_like(val_sequences)
-            val_basket_masks[val_sequences == config.pad_token_id] = 0
-        
-        val_targets_padded = np.load(os.path.join(data_dir, 'val/targets_padded.npy'))
-        
-        # Try to load multihot targets
-        try:
-            val_targets_multihot = np.load(os.path.join(data_dir, 'val/targets_multihot.npy'))
-        except:
-            val_targets_multihot = None
-        
-        # Load masked positions and labels
-        try:
-            with open(os.path.join(data_dir, 'val/masked_positions.pkl'), 'rb') as f:
-                val_masked_positions = pickle.load(f)
-            
-            with open(os.path.join(data_dir, 'val/masked_labels.pkl'), 'rb') as f:
-                val_masked_labels = pickle.load(f)
-        except:
-            val_masked_positions = None
-            val_masked_labels = None
-        
-        # Create validation dataset
-        val_dataset = BasketBERT4RecDataset(
-            sequences=val_sequences,
-            sequence_masks=val_sequence_masks,
-            basket_masks=val_basket_masks,
-            masked_positions=val_masked_positions,
-            masked_labels=val_masked_labels,
-            targets_padded=val_targets_padded,
-            targets_multihot=val_targets_multihot,
-            mode='mlm'  # Use MLM for validation
-        )
-    else:
-        val_dataset = None
-    
-    print(f"Data loaded: {len(train_dataset)} training examples, ", end="")
-    print(f"{len(val_dataset) if val_dataset else 0} validation examples")
-    
-    return config, train_dataset, val_dataset
-
-
-def train_model(data_dir='./bert4rec_data/', output_dir='./bert4rec_model/',
-                batch_size=16, num_epochs=10, learning_rate=0.001,
-                use_gpu=True):
-    """
-    Train a BasketBERT4Rec model on the preprocessed data.
-    
-    Args:
-        data_dir: Directory containing preprocessed data files.
-        output_dir: Directory to save model outputs.
-        batch_size: Training batch size.
-        num_epochs: Number of training epochs.
-        learning_rate: Learning rate for optimization.
-        use_gpu: Whether to use GPU for training if available.
-    
-    Returns:
-        model: Trained BasketBERT4Rec model
-        trainer: Model trainer with training history
-    """
-    # Determine device
-    device = torch.device('cuda' if torch.cuda.is_available() and use_gpu else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Load data for training
-    config, train_dataset, val_dataset = load_data_for_training(data_dir)
-    
-    # Create model
-    model = BasketBERT4Rec(config)
-    
-    # Create trainer
-    trainer = BasketBERT4RecTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        batch_size=batch_size,
-        lr=learning_rate,
-        weight_decay=0.01,
-        num_epochs=num_epochs,
-        device=device,
-        output_dir=output_dir,
-        mlm_weight=1.0,  # Weight for masked language modeling loss
-        nbr_weight=0.5   # Weight for next basket recommendation loss
-    )
-    
-    # Train model
-    training_metrics = trainer.train()
-    
-    # Save item embeddings
-    item_embeddings = model.get_item_embeddings().cpu().numpy()
-    np.save(os.path.join(output_dir, 'item_embeddings.npy'), item_embeddings)
-    
-    # Save final model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': model.config.__dict__
-    }, os.path.join(output_dir, 'final_model.pt'))
-    
-    print(f"Training completed! Model saved to {output_dir}")
-    
-    # Return model and trainer for further analysis
-    return model, trainer
 
 
 if __name__ == "__main__":
-    # Command line arguments
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Train BasketBERT4Rec model')
-    parser.add_argument('--data_dir', type=str, default='./bert4rec_data/', 
-                        help='Directory with preprocessed data')
-    parser.add_argument('--output_dir', type=str, default='./bert4rec_model/', 
-                        help='Directory to save model outputs')
-    parser.add_argument('--batch_size', type=int, default=16, 
-                        help='Training batch size')
-    parser.add_argument('--num_epochs', type=int, default=10, 
-                        help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=0.001, 
-                        help='Learning rate')
-    parser.add_argument('--cpu', action='store_true', 
-                        help='Force using CPU even if GPU is available')
-    
-    args = parser.parse_args()
-    
-    # Train model
-    model, trainer = train_model(
-        data_dir=args.data_dir,
-        output_dir=args.output_dir,
-        batch_size=args.batch_size,
-        num_epochs=args.num_epochs,
-        learning_rate=args.learning_rate,
-        use_gpu=not args.cpu
+    # Train and evaluate the model
+    model, trainer, test_metrics = train_model(
+        data_dir='./bert4rec_data/',  # Directory with prepared data
+        output_dir='./bert4rec_model/',  # Directory to save model outputs
+        batch_size=32,  # Reduced from 64
+        num_epochs=10,   # Reduced from 10
+        learning_rate=0.001
     )

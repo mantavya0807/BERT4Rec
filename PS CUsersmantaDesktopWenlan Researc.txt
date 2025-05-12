@@ -1,0 +1,86 @@
+PS C:\Users\manta\Desktop\Wenlan Research\BERT4Rec> & C:/Users/manta/AppData/Local/Programs/Python/Python312/python.exe "c:/Users/manta/Desktop/Wenlan Research/BERT4Rec/3.py"
+
+PyTorch version: 2.5.1+cu121
+CUDA Available: True
+Device Count: 1
+Device Name (GPU 0): NVIDIA GeForce RTX 4050 Laptop GPU
+Using NVIDIA GPU: NVIDIA GeForce RTX 4050 Laptop GPU
+Loading data from ./bert4rec_data/...
+Data loaded: 104966 training examples, 26242 validation examples, 0 test examples
+Starting training for 15 epochs...
+Epoch 1 [Train]:   0%|                                       | 0/1641 [00:00<?, ?it/s]c:\Users\manta\Desktop\Wenlan Research\BERT4Rec\3.py:648: UserWarning: Creating a tensor from a list of numpy.ndarrays is extremely slow. Please consider converting the list to a single numpy.ndarray with numpy.array() before converting to a tensor. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\torch\csrc\utils\tensor_new.cpp:281.)
+  labels = torch.tensor(labels, dtype=torch.long)
+Epoch 1 [Train]: 100%|█| 1641/1641 [06:34<00:00,  4.16it/s, loss=0.0001, mlm_loss=0.00
+Epoch 1 [Val]: 100%|█| 411/411 [01:01<00:00,  6.66it/s, loss=0.0002, mlm_loss=0.0002,  
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_1.pt
+Epoch 1/15 - Train Loss: 0.0008, Val Loss: 0.0001
+Epoch 2 [Train]: 100%|█| 1641/1641 [04:28<00:00,  6.11it/s, loss=0.0002, mlm_loss=0.00 
+Epoch 2 [Val]: 100%|█| 411/411 [00:56<00:00,  7.28it/s, loss=0.0002, mlm_loss=0.0002,  
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_2.pt
+Epoch 2/15 - Train Loss: 0.0001, Val Loss: 0.0001
+Epoch 3 [Train]: 100%|█| 1641/1641 [05:30<00:00,  4.97it/s, loss=0.0002, mlm_loss=0.00 
+Epoch 3 [Val]: 100%|█| 411/411 [01:02<00:00,  6.60it/s, loss=0.0002, mlm_loss=0.0002,  
+Model saved to ./bert4rec_model/model_epoch_3.pt
+Epoch 3/15 - Train Loss: 0.0002, Val Loss: 0.0001
+Epoch 4 [Train]: 100%|█| 1641/1641 [06:14<00:00,  4.38it/s, loss=0.0001, mlm_loss=0.00 
+Epoch 4 [Val]: 100%|█| 411/411 [00:58<00:00,  7.08it/s, loss=0.0002, mlm_loss=0.0002,  
+Model saved to ./bert4rec_model/model_epoch_4.pt
+Epoch 4/15 - Train Loss: 0.0001, Val Loss: 0.0001
+Epoch 5 [Train]: 100%|█| 1641/1641 [04:11<00:00,  6.52it/s, loss=0.0002, mlm_loss=0.00 
+Epoch 5 [Val]: 100%|█| 411/411 [00:59<00:00,  6.89it/s, loss=0.0002, mlm_loss=0.0002,  
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_5.pt
+Epoch 5/15 - Train Loss: 0.0001, Val Loss: 0.0001
+Epoch 6 [Train]: 100%|█| 1641/1641 [04:06<00:00,  6.66it/s, loss=0.0002, mlm_loss=0.00 
+Epoch 6 [Val]: 100%|█| 411/411 [00:56<00:00,  7.32it/s, loss=0.0002, mlm_loss=0.0002,  
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_6.pt
+Epoch 6/15 - Train Loss: 0.0001, Val Loss: 0.0001
+Epoch 7 [Train]: 100%|█| 1641/1641 [1:01:34<00:00,  2.25s/it, loss=0.0002, mlm_loss=0. 
+Epoch 7 [Val]: 100%|█| 411/411 [01:35<00:00,  4.33it/s, loss=0.0002, mlm_loss=0.0002,  
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_7.pt
+Epoch 7/15 - Train Loss: 0.0001, Val Loss: 0.0001
+Epoch 8 [Train]: 100%|█| 1641/1641 [08:25<00:00,  3.24it/s, loss=0.0001, mlm_loss=0.00 
+Epoch 8 [Val]: 100%|█| 411/411 [02:02<00:00,  3.34it/s, loss=0.0001, mlm_loss=0.0001,  
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_8.pt
+Epoch 8/15 - Train Loss: 0.0001, Val Loss: 0.0001
+Epoch 9 [Train]: 100%|█| 1641/1641 [1:19:38<00:00,  2.91s/it, loss=0.0001, mlm_loss=0. 
+Epoch 9 [Val]: 100%|█| 411/411 [01:59<00:00,  3.43it/s, loss=0.0001, mlm_loss=0.0001,  
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_9.pt
+Epoch 9/15 - Train Loss: 0.0001, Val Loss: 0.0001
+Epoch 10 [Train]: 100%|█| 1641/1641 [08:05<00:00,  3.38it/s, loss=0.0000, mlm_loss=0.0 
+Epoch 10 [Val]: 100%|█| 411/411 [03:00<00:00,  2.28it/s, loss=0.0001, mlm_loss=0.0001, 
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_10.pt
+Epoch 10/15 - Train Loss: 0.0000, Val Loss: 0.0000
+Epoch 11 [Train]: 100%|█| 1641/1641 [17:52<00:00,  1.53it/s, loss=0.0001, mlm_loss=0.0 
+Epoch 11 [Val]: 100%|█| 411/411 [05:23<00:00,  1.27it/s, loss=0.0001, mlm_loss=0.0001, 
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_11.pt
+Epoch 11/15 - Train Loss: 0.0000, Val Loss: 0.0000
+Epoch 12 [Train]: 100%|█| 1641/1641 [19:05<00:00,  1.43it/s, loss=0.0000, mlm_loss=0.0 
+Epoch 12 [Val]: 100%|█| 411/411 [05:20<00:00,  1.28it/s, loss=0.0001, mlm_loss=0.0001, 
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_12.pt
+Epoch 12/15 - Train Loss: 0.0000, Val Loss: 0.0000
+Epoch 13 [Train]: 100%|█| 1641/1641 [19:03<00:00,  1.44it/s, loss=0.0000, mlm_loss=0.0 
+Epoch 13 [Val]: 100%|█| 411/411 [05:19<00:00,  1.29it/s, loss=0.0000, mlm_loss=0.0000, 
+Model saved to ./bert4rec_model/best_model.pt
+Model saved to ./bert4rec_model/model_epoch_13.pt
+Epoch 13/15 - Train Loss: 0.0000, Val Loss: 0.0000
+Epoch 14 [Train]: 100%|█| 1641/1641 [17:51<00:00,  1.53it/s, loss=0.0000, mlm_loss=0.0 
+Epoch 14 [Val]: 100%|█| 411/411 [01:42<00:00,  4.02it/s, loss=0.0000, mlm_loss=0.0000, 
+Model saved to ./bert4rec_model/model_epoch_14.pt
+Epoch 14/15 - Train Loss: 0.0000, Val Loss: 0.0000
+Epoch 15 [Train]: 100%|█| 1641/1641 [07:38<00:00,  3.58it/s, loss=0.0000, mlm_loss=0.0 
+Epoch 15 [Val]: 100%|█| 411/411 [01:40<00:00,  4.07it/s, loss=0.0000, mlm_loss=0.0000, 
+Model saved to ./bert4rec_model/model_epoch_15.pt
+Epoch 15/15 - Train Loss: 0.0000, Val Loss: 0.0000
+Training completed!
+Training completed! Model saved to ./bert4rec_model/
+PS C:\Users\manta\Desktop\Wenlan Research\BERT4Rec> 
