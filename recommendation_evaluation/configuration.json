@@ -1,0 +1,16 @@
+{
+  "svd_dimensions": 10,
+  "kmeans_clusters": 5,
+  "explained_variance": 0.09176512062549591,
+  "test_sequences": 131208,
+  "embedding_shape": {
+    "original": [
+      49468,
+      128
+    ],
+    "reduced": [
+      49468,
+      10
+    ]
+  }
+}

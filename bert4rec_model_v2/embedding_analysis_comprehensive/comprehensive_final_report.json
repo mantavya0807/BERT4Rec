@@ -1,0 +1,67 @@
+{
+  "analysis_metadata": {
+    "timestamp": "2025-05-22 22:20:55",
+    "analysis_type": "comprehensive_high_quality",
+    "total_embeddings_processed": 30002,
+    "embedding_dimensions": 128,
+    "sample_strategy": "stratified_smart_sampling",
+    "max_sample_size": 30000
+  },
+  "clustering_performance": {
+    "total_methods_tested": 6,
+    "total_parameter_combinations": 27,
+    "successful_combinations": 23,
+    "success_rate": 0.8518518518518519
+  },
+  "best_clustering_method": {
+    "method": "spectral",
+    "params": "k5",
+    "silhouette": "-0.012360844",
+    "calinski_harabasz": "42.7893",
+    "n_clusters": 5,
+    "noise_ratio": 0.0,
+    "combined_score": 0.09619701653718948
+  },
+  "cluster_analysis": {
+    "total_clusters": 5,
+    "average_coherence": 0.18666666666666668,
+    "department_coverage": 3,
+    "department_representation": {
+      "snacks": [
+        {
+          "cluster_size": "7230",
+          "coherence": 0.2
+        },
+        {
+          "cluster_size": "3788",
+          "coherence": 0.2
+        }
+      ],
+      "dairy eggs": [
+        {
+          "cluster_size": "6636",
+          "coherence": 0.26666666666666666
+        },
+        {
+          "cluster_size": "5888",
+          "coherence": 0.13333333333333333
+        }
+      ],
+      "personal care": [
+        {
+          "cluster_size": "6458",
+          "coherence": 0.13333333333333333
+        }
+      ]
+    }
+  },
+  "quality_assessment": {
+    "overall_quality": "fair",
+    "clustering_interpretability": "low"
+  },
+  "recommendations": {
+    "best_method_for_production": "spectral with k5",
+    "suggested_num_clusters": 5,
+    "embedding_quality": "good"
+  }
+}

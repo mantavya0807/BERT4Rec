@@ -1,0 +1,31 @@
+{
+  "analysis_timestamp": "2025-05-22 20:22:12",
+  "memory_optimized": true,
+  "max_sample_size": 10000,
+  "best_clustering_method": {
+    "method": "kmeans",
+    "params": "k5",
+    "silhouette": "-0.013902388",
+    "calinski_harabasz": "10.255343",
+    "n_clusters": 5,
+    "noise_ratio": 0.0,
+    "combined_score": -0.012876853346824646
+  },
+  "cluster_analysis_summary": {
+    "n_clusters_analyzed": 5,
+    "most_common_departments": [
+      [
+        "beverages",
+        2
+      ],
+      [
+        "personal care",
+        2
+      ],
+      [
+        "pantry",
+        1
+      ]
+    ]
+  }
+}
